@@ -9,7 +9,10 @@ import * as path from 'path'
 import * as refHelper from './ref-helper'
 import * as stateHelper from './state-helper'
 import * as urlHelper from './url-helper'
-import {IGitCommandManager} from './git-command-manager'
+import {
+  MinimumGitSparseCheckoutVersion,
+  IGitCommandManager
+} from './git-command-manager'
 import {IGitSourceSettings} from './git-source-settings'
 
 export async function getSource(settings: IGitSourceSettings): Promise<void> {
@@ -153,23 +156,60 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
 
     // Fetch
     core.startGroup('Fetching the repository')
+    const fetchOptions: {
+      filter?: string
+      fetchDepth?: number
+      showProgress?: boolean
+    } = {}
+
+    if (settings.filter) {
+      fetchOptions.filter = settings.filter
+    } else if (settings.sparseCheckout) {
+      fetchOptions.filter = 'blob:none'
+    }
+
     if (settings.fetchDepth <= 0) {
       // Fetch all branches and tags
       let refSpec = refHelper.getRefSpecForAllHistory(
         settings.ref,
         settings.commit
       )
-      await git.fetch(refSpec)
+      await git.fetch(refSpec, fetchOptions)
 
       // When all history is fetched, the ref we're interested in may have moved to a different
       // commit (push or force push). If so, fetch again with a targeted refspec.
       if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
         refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-        await git.fetch(refSpec)
+        await git.fetch(refSpec, fetchOptions)
+
+        // Verify the ref now matches. For branches, the targeted fetch above brings
+        // in the specific commit. For tags (fetched by ref), this will fail if
+        // the tag was moved after the workflow was triggered.
+        if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+          throw new Error(
+            `The ref '${settings.ref}' does not point to the expected commit '${settings.commit}'. ` +
+              `The ref may have been updated after the workflow was triggered.`
+          )
+        }
       }
     } else {
-      const refSpec = refHelper.getRefSpec(settings.ref, settings.commit)
-      await git.fetch(refSpec, settings.fetchDepth)
+      fetchOptions.fetchDepth = settings.fetchDepth
+      const refSpec = refHelper.getRefSpec(
+        settings.ref,
+        settings.commit,
+        settings.fetchTags
+      )
+      await git.fetch(refSpec, fetchOptions)
+
+      // For tags, verify the ref still points to the expected commit.
+      // Tags are fetched by ref (not commit), so if a tag was moved after the
+      // workflow was triggered, we would silently check out the wrong commit.
+      if (!(await refHelper.testRef(git, settings.ref, settings.commit))) {
+        throw new Error(
+          `The ref '${settings.ref}' does not point to the expected commit '${settings.commit}'. ` +
+            `The ref may have been updated after the workflow was triggered.`
+        )
+      }
     }
     core.endGroup()
 
@@ -185,9 +225,27 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // LFS fetch
     // Explicit lfs-fetch to avoid slow checkout (fetches one lfs object at a time).
     // Explicit lfs fetch will fetch lfs objects in parallel.
-    if (settings.lfs) {
+    // For sparse checkouts, let `checkout` fetch the needed objects lazily.
+    if (settings.lfs && !settings.sparseCheckout) {
       core.startGroup('Fetching LFS objects')
       await git.lfsFetch(checkoutInfo.startPoint || checkoutInfo.ref)
+      core.endGroup()
+    }
+
+    // Sparse checkout
+    if (!settings.sparseCheckout) {
+      let gitVersion = await git.version()
+      // no need to disable sparse-checkout if the installed git runtime doesn't even support it.
+      if (gitVersion.checkMinimum(MinimumGitSparseCheckoutVersion)) {
+        await git.disableSparseCheckout()
+      }
+    } else {
+      core.startGroup('Setting up sparse checkout')
+      if (settings.sparseCheckoutConeMode) {
+        await git.sparseCheckout(settings.sparseCheckout)
+      } else {
+        await git.sparseCheckoutNonConeMode(settings.sparseCheckout)
+      }
       core.endGroup()
     }
 
@@ -225,7 +283,8 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     const commitInfo = await git.log1()
 
     // Log commit sha
-    await git.log1("--format='%H'")
+    const commitSHA = await git.log1('--format=%H')
+    core.setOutput('commit', commitSHA.trim())
 
     // Check for incorrect pull request merge commit
     await refHelper.checkCommitInfo(
@@ -261,7 +320,11 @@ export async function cleanup(repositoryPath: string): Promise<void> {
 
   let git: IGitCommandManager
   try {
-    git = await gitCommandManager.createCommandManager(repositoryPath, false)
+    git = await gitCommandManager.createCommandManager(
+      repositoryPath,
+      false,
+      false
+    )
   } catch {
     return
   }
@@ -297,7 +360,8 @@ async function getGitCommandManager(
   try {
     return await gitCommandManager.createCommandManager(
       settings.repositoryPath,
-      settings.lfs
+      settings.lfs,
+      settings.sparseCheckout != null
     )
   } catch (err) {
     // Git is required for LFS
